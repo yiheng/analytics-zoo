@@ -47,8 +47,8 @@ object ImageInferenceExample {
         .setFeaturesCol("image")
         .setPredictionCol("prediction")
 
-      val resultDF = dlmodel.transform(imageDF)
-      resultDF.select("imageName", "prediction").show(10, false)
+      //val resultDF = dlmodel.transform(imageDF)
+      //resultDF.select("imageName", "prediction").show(10, false)
     }
   }
 }

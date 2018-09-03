@@ -35,7 +35,7 @@ import org.apache.spark.ml.param._
 import org.apache.spark.ml.util._
 import org.apache.spark.ml.{DLEstimatorBase, DLTransformerBase, DefaultParamsWriterWrapper}
 import org.apache.spark.sql.types._
-import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.{DataFrame, Dataset, Row}
 import org.json4s.JsonDSL._
 import org.json4s.{DefaultFormats, JObject}
 
@@ -392,6 +392,8 @@ class NNEstimator[T: ClassTag] private[zoo] (
     }
     copied
   }
+
+  override def fit(dataset: Dataset[_]): NNModel[T] = ???
 }
 
 object NNEstimator {
@@ -568,6 +570,8 @@ class NNModel[T: ClassTag] private[zoo] (
   }
 
   override def write: MLWriter = new NNModel.NNModelWriter[T](this)
+
+  override def transform(dataset: Dataset[_]): DataFrame = ???
 }
 
 object NNModel extends MLReadable[NNModel[_]] {

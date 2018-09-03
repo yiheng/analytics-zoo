@@ -17,10 +17,10 @@
 package com.intel.analytics.zoo.examples.recommendation
 
 import com.intel.analytics.bigdl._
-import com.intel.analytics.bigdl.dataset.Sample
+import com.intel.analytics.bigdl.dataset.{DataSet, Sample, SampleToBatch, SampleToMiniBatch}
 import com.intel.analytics.bigdl.nn.ClassNLLCriterion
 import com.intel.analytics.bigdl.numeric.NumericFloat
-import com.intel.analytics.bigdl.optim.{Adam, Optimizer, Trigger}
+import com.intel.analytics.bigdl.optim._
 import com.intel.analytics.bigdl.tensor.Tensor
 import com.intel.analytics.bigdl.utils.T
 import com.intel.analytics.zoo.common.NNContext
@@ -31,9 +31,10 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, SQLContext}
 import org.apache.spark.sql.functions._
 import scopt.OptionParser
+import com.intel.analytics.bigdl.example.recommendation.NeuralCFV2
 
 case class NeuralCFParams(val inputDir: String = "./data/ml-1m",
-                          val batchSize: Int = 8000,
+                          val batchSize: Int = 2048,
                           val nEpochs: Int = 10,
                           val learningRate: Double = 1e-3,
                           val learningRateDecay: Double = 1e-6
@@ -74,19 +75,25 @@ object NeuralCFexample {
     Logger.getLogger("org").setLevel(Level.ERROR)
     val conf = new SparkConf()
     conf.setAppName("NCFExample").set("spark.sql.crossJoin.enabled", "true")
+    conf.set("spark.driver.maxResultSize", "2048")
     val sc = NNContext.initNNContext(conf)
     val sqlContext = SQLContext.getOrCreate(sc)
 
-    val (ratings, userCount, itemCount) = loadPublicData(sqlContext, param.inputDir)
+    val (ratings, userCount, itemCount) = loadMl20mData(sqlContext, param.inputDir)
 
     val isImplicit = false
-    val ncf = NeuralCF[Float](
+    val ncf = NeuralCFV2[Float](
       userCount = userCount,
       itemCount = itemCount,
       numClasses = 5,
-      userEmbed = 20,
-      itemEmbed = 20,
-      hiddenLayers = Array(40, 20, 10))
+      userEmbed = 128,
+      itemEmbed = 128,
+      hiddenLayers = Array(256, 128, 64),
+      includeMF = true,
+      mfEmbed = 64
+    )
+    // val plength = ncf.parameters()._1.map(_.nElements()).reduce(_+_)
+    // println(s"parameter length: $plengt")
 
     val pairFeatureRdds: RDD[UserItemFeature[Float]] =
       assemblyFeature(isImplicit, ratings, userCount, itemCount)
@@ -94,15 +101,15 @@ object NeuralCFexample {
     val Array(trainpairFeatureRdds, validationpairFeatureRdds) =
       pairFeatureRdds.randomSplit(Array(0.8, 0.2))
     val trainRdds = trainpairFeatureRdds.map(x => x.sample)
+    val trainData = DataSet.array(trainRdds.collect()) -> SampleToMiniBatch(param.batchSize)
     val validationRdds = validationpairFeatureRdds.map(x => x.sample)
 
-    val optimizer = Optimizer(
+    val optimizer = new NCFOptimizer(
       model = ncf,
-      sampleRDD = trainRdds,
-      criterion = ClassNLLCriterion[Float](),
-      batchSize = param.batchSize)
+      dataset = trainData.toLocal(),
+      criterion = ClassNLLCriterion[Float]())
 
-    val optimMethod = new Adam[Float](
+    val optimMethod = new ParallelAdam[Float](
       learningRate = param.learningRate,
       learningRateDecay = param.learningRateDecay)
 
@@ -116,7 +123,7 @@ object NeuralCFexample {
     val resultsClass = ncf.predictClass(validationRdds)
     resultsClass.take(5).foreach(println)
 
-    val userItemPairPrediction = ncf.predictUserItemPair(validationpairFeatureRdds)
+    /*val userItemPairPrediction = ncf.predictUserItemPair(validationpairFeatureRdds)
 
     userItemPairPrediction.take(5).foreach(println)
 
@@ -124,7 +131,7 @@ object NeuralCFexample {
     val itemRecs = ncf.recommendForItem(validationpairFeatureRdds, 3)
 
     userRecs.take(10).foreach(println)
-    itemRecs.take(10).foreach(println)
+    itemRecs.take(10).foreach(println)*/
   }
 
   def loadPublicData(sqlContext: SQLContext, dataPath: String): (DataFrame, Int, Int) = {
@@ -141,6 +148,36 @@ object NeuralCFexample {
     (ratings, userCount, itemCount)
   }
 
+  def loadMl20mData(sqlContext: SQLContext, dataPath: String): (DataFrame, Int, Int) = {
+    import sqlContext.implicits._
+    val ratings = sqlContext.read
+      .option("inferSchema", "true")
+      .option("header", "true")
+      .option("delimiter", ",")
+      .csv(dataPath + "/ratings.csv")
+      .toDF()
+    println(ratings.schema)
+
+    val minMaxRow = ratings.agg(max("userId")).collect()(0)
+    val userCount = minMaxRow.getInt(0)
+
+    val uniqueMovie = ratings.rdd.map(_.getAs[Int]("movieId")).distinct().collect()
+    val mapping = uniqueMovie.zip(1 to uniqueMovie.length).toMap
+
+    val bcMovieMapping = sqlContext.sparkContext.broadcast(mapping)
+
+    val mappingUdf = udf((itemId: Int) => {
+      bcMovieMapping.value(itemId)
+    })
+    val mappedItemID = mappingUdf.apply(col("movieId"))
+    val mappedRating = ratings//.drop(col("itemId"))
+      .withColumn("movieId", mappedItemID)
+    mappedRating.show()
+
+
+    (mappedRating, userCount, uniqueMovie.length)
+  }
+
   def assemblyFeature(isImplicit: Boolean = false,
                       indexed: DataFrame,
                       userCount: Int,
@@ -153,12 +190,12 @@ object NeuralCFexample {
     else indexed
 
     val rddOfSample: RDD[UserItemFeature[Float]] = unioned
-      .select("userId", "itemId", "label")
+      .select("userId", "movieId", "rating")
       .rdd.map(row => {
       val uid = row.getAs[Int](0)
       val iid = row.getAs[Int](1)
 
-      val label = row.getAs[Int](2)
+      val label = row.getAs[Double](2).ceil.toInt
       val feature: Tensor[Float] = Tensor[Float](T(uid.toFloat, iid.toFloat))
 
       UserItemFeature(uid, iid, Sample(feature, Tensor[Float](T(label))))
