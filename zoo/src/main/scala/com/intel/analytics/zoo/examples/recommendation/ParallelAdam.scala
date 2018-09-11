@@ -16,6 +16,8 @@
 
 package com.intel.analytics.bigdl.optim
 
+import com.intel.analytics.bigdl.mkl.MklDnn
+import com.intel.analytics.bigdl.mkl.hardware.Affinity
 import com.intel.analytics.bigdl.tensor.{Storage, Tensor}
 import com.intel.analytics.bigdl.tensor.TensorNumericMath.TensorNumeric
 import com.intel.analytics.bigdl.utils.{Engine, T, Table}
@@ -103,9 +105,9 @@ class ParallelAdam[@specialized(Float, Double) T: ClassTag](
       times(tid) = (System.nanoTime() - start) / 1000000L
     }))
 
-    ParallelAdam.logger.
-      info(s"update ${parameter.nElement()} parameters, maximum time is ${times.max} ms")
-    ParallelAdam.logger.info(s"Time is ${times.sortWith((a, b) => a > b).mkString("\t")} ms")
+    //ParallelAdam.logger.
+    //  info(s"update ${parameter.nElement()} parameters, maximum time is ${times.max} ms")
+    //ParallelAdam.logger.info(s"Time is ${times.sortWith((a, b) => a > b).mkString("\t")} ms")
 
 
     state("evalCounter") = timestep // A tmp tensor to hold the sqrt(v) + epsilon
@@ -146,8 +148,8 @@ object ParallelAdam {
     // 7ms ~ 10ms
     _s.mul(ev.fromType[Double](beta1)).add(ev.fromType[Double](1-beta1), dfdx)
     _denom.cmul(dfdx, dfdx)
-    
-    // 10ms 
+
+    // 10ms
     _r.mul(ev.fromType[Double](beta2)).add(ev.fromType[Double](1-beta2), _denom)
     _denom.sqrt(_r)
 
@@ -172,7 +174,7 @@ object ParallelAdam {
     clr: Double, parameter: Tensor[T],
     beta1: Double, beta2: Double,
     ones: Tensor[T], eps: Double)(
-     implicit ev: TensorNumeric[T]): Unit = {
+    implicit ev: TensorNumeric[T]): Unit = {
 
     var timestep = lastUpdatedIteration
     while(timestep < currentIteration) {

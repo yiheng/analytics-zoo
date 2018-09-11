@@ -19,6 +19,8 @@ package com.intel.analytics.bigdl.optim
 import com.intel.analytics.bigdl.dataset.{LocalDataSet, MiniBatch}
 import com.intel.analytics.bigdl._
 import com.intel.analytics.bigdl.example.recommendation.NeuralCFV2
+import com.intel.analytics.bigdl.mkl.MklDnn
+import com.intel.analytics.bigdl.mkl.hardware.Affinity
 import com.intel.analytics.bigdl.nn.{Graph, Utils}
 import com.intel.analytics.bigdl.nn.abstractnn.{AbstractModule, Activity}
 import com.intel.analytics.bigdl.tensor.Tensor
@@ -90,7 +92,10 @@ class NCFOptimizer[T: ClassTag] (
   private val workingCriterion =
     (1 to subModelNumber).map(_ => criterion.cloneCriterion()).toArray
 
+  var embeddingOptim: EmbeddingAdam2[T] = _
+
   override def optimize(): Module[T] = {
+    MklDnn.isLoaded
     var wallClockTime = 0L
     var count = 0
     optimMethods.values.foreach { optimMethod =>
@@ -100,22 +105,13 @@ class NCFOptimizer[T: ClassTag] (
     state("neval") = state.get[Int]("neval").getOrElse(1)
     state("isLayerwiseScaled") = Utils.isLayerwiseScaled(model)
     val optimMethod: OptimMethod[T] = optimMethods(model.getName())
-    val optimMethod2: OptimMethod[T] = optimMethods(model.getName()).clone()
+
     dataset.shuffle()
     val numSamples = dataset.data(train = false).map(_.size()).reduce(_ + _)
     var iter = dataset.data(train = true)
     logger.info("model thread pool size is " + Engine.model.getPoolSize)
     while (!endWhen(state)) {
       val start = System.nanoTime()
-      // println("start")
-
-      val tasks = Engine.default.invoke((0 until embeddingSyncGradParallelNum).map(tid =>
-        () => {
-          val offset = tid * embeddingSyncGradTaskSize + math.min(tid, embeddingSyncGradExtraTask)
-          val length = embeddingSyncGradTaskSize +
-            (if (tid < embeddingSyncGradExtraTask) 1 else 0)
-          embeddingGrad.narrow(1, offset + 1, length).zero()
-        }))
 
       // Fetch data and prepare tensors
       val batch = iter.next()
@@ -136,6 +132,7 @@ class NCFOptimizer[T: ClassTag] (
       val lossSum = Engine.default.invokeAndWait(
         (0 until parallelism).map(i =>
           () => {
+            // Affinity.setAffinity()
             val start = System.nanoTime()
             val localEmbedding = workingEmbeddingModels(i)
             val localLinears = workingLinears(i)
@@ -164,45 +161,18 @@ class NCFOptimizer[T: ClassTag] (
       val loss = lossSum / parallelism
 
       val computingTime = System.nanoTime()
-      // println("computingTime")
-
-      Engine.default.sync(tasks)
-//      Engine.default.invokeAndWait(
-//        (0 until embeddingSyncGradParallelNum).map(tid =>
-//          () => {
-//            val offset = tid * embeddingSyncGradTaskSize
-//            + math.min(tid, embeddingSyncGradExtraTask)
-//            val length = embeddingSyncGradTaskSize +
-//              (if (tid < embeddingSyncGradExtraTask) 1 else 0)
-//            embeddingGrad.narrow(1, offset + 1, length).zero()
-//          })
-//      )
-
       val zeroGradTime = System.nanoTime()
-      // println("zeroGrad")
 
-      (0 until parallelism).foreach { i =>
-        val input = miniBatchBuffer(i).getInput()
+
+      (0 until parallelism).toArray.foreach { i =>
         val localEmbedding = workingEmbeddingModels(i).asInstanceOf[Graph[T]]
         val input1 = localEmbedding("userId").get.output.asInstanceOf[Tensor[T]]
         val input2 = localEmbedding("itemId").get.output.asInstanceOf[Tensor[T]]
-        val mlpUserEmbedding = localEmbedding("mlpUserEmbedding").get
-          .asInstanceOf[AbstractModule[Activity, Activity, T]]
-        val mlpItemEmbedding = localEmbedding("mlpItemEmbedding").get
-          .asInstanceOf[AbstractModule[Activity, Activity, T]]
-        val mfUserEmbedding = localEmbedding("mfUserEmbedding").get
-          .asInstanceOf[AbstractModule[Activity, Activity, T]]
-        val mfItemEmbedding = localEmbedding("mfItemEmbedding").get
-          .asInstanceOf[AbstractModule[Activity, Activity, T]]
         val localLinears = workingLinears(i)
-        val a = Seq(
-          (mlpUserEmbedding, input1, localLinears.gradInput.toTable[Tensor[T]](1)),
-          (mlpItemEmbedding, input2, localLinears.gradInput.toTable[Tensor[T]](2)),
-          (mfUserEmbedding, input1, localLinears.gradInput.toTable[Tensor[T]](3)),
-          (mfItemEmbedding, input2, localLinears.gradInput.toTable[Tensor[T]](4)))
-        Engine.default.invokeAndWait(a.map(v => () => {
-          v._1.accGradParameters(v._2, v._3)
-        }))
+        embeddingOptim.gradients(0)(i) = (input1, localLinears.gradInput.toTable[Tensor[T]](1))
+        embeddingOptim.gradients(1)(i) = (input2, localLinears.gradInput.toTable[Tensor[T]](2))
+        embeddingOptim.gradients(2)(i) = (input1, localLinears.gradInput.toTable[Tensor[T]](3))
+        embeddingOptim.gradients(3)(i) = (input2, localLinears.gradInput.toTable[Tensor[T]](4))
       }
 
       val computingTime2 = System.nanoTime()
@@ -238,9 +208,9 @@ class NCFOptimizer[T: ClassTag] (
 
       val updateWeightTime1 = System.nanoTime()
 
-      optimMethod2.state.update("epoch", state.get("epoch"))
-      optimMethod2.state.update("neval", state.get("neval"))
-      optimMethod2.optimize(_ => (ev.fromType(loss), embeddingGrad), embeddingWeight)
+      embeddingOptim.state.update("epoch", state.get("epoch"))
+      embeddingOptim.state.update("neval", state.get("neval"))
+      embeddingOptim.optimize(_ => (ev.fromType(loss), null), embeddingWeight)
 
       val updateWeightTime2 = System.nanoTime()
       // println("update weight")
@@ -251,7 +221,7 @@ class NCFOptimizer[T: ClassTag] (
       logger.info(s"$head " +
         s"loss is $loss, iteration time is ${(end - start) / 1e9}s " +
         s"train time ${(end - dataFetchTime) / 1e9}s. " +
-        s"Throughput is ${batch.size().toDouble / (end - start) * 1e9} record / second. " +
+        s"Throughput is ${batch.size().toDouble / (end - dataFetchTime) * 1e9} record / second. " +
         optimMethod.getHyperParameter()
         )
       logger.info( s"data fetch time is ${(dataFetchTime - start) / 1e9}s " +

@@ -72,6 +72,7 @@ object NeuralCFexample {
   }
 
   def run(param: NeuralCFParams): Unit = {
+    println("=====>" + System.getProperty("bigdl.utils.Engine.defaultPoolSize"))
     Logger.getLogger("org").setLevel(Level.ERROR)
     val conf = new SparkConf()
     conf.setAppName("NCFExample").set("spark.sql.crossJoin.enabled", "true")
@@ -80,6 +81,8 @@ object NeuralCFexample {
     val sqlContext = SQLContext.getOrCreate(sc)
 
     val (ratings, userCount, itemCount) = loadMl20mData(sqlContext, param.inputDir)
+    println(s"user count is $userCount")
+    println(s"item count is $itemCount")
 
     val isImplicit = false
     val ncf = NeuralCFV2[Float](
@@ -92,8 +95,6 @@ object NeuralCFexample {
       includeMF = true,
       mfEmbed = 64
     )
-    // val plength = ncf.parameters()._1.map(_.nElements()).reduce(_+_)
-    // println(s"parameter length: $plengt")
 
     val pairFeatureRdds: RDD[UserItemFeature[Float]] =
       assemblyFeature(isImplicit, ratings, userCount, itemCount)
@@ -113,6 +114,10 @@ object NeuralCFexample {
       learningRate = param.learningRate,
       learningRateDecay = param.learningRateDecay)
 
+    optimizer.embeddingOptim = new EmbeddingAdam2[Float](
+      learningRate = param.learningRate,
+      learningRateDecay = param.learningRateDecay)
+
     optimizer
       .setOptimMethod(optimMethod)
       .setEndWhen(Trigger.maxEpoch(param.nEpochs))
@@ -122,16 +127,6 @@ object NeuralCFexample {
     results.take(5).foreach(println)
     val resultsClass = ncf.predictClass(validationRdds)
     resultsClass.take(5).foreach(println)
-
-    /*val userItemPairPrediction = ncf.predictUserItemPair(validationpairFeatureRdds)
-
-    userItemPairPrediction.take(5).foreach(println)
-
-    val userRecs = ncf.recommendForUser(validationpairFeatureRdds, 3)
-    val itemRecs = ncf.recommendForItem(validationpairFeatureRdds, 3)
-
-    userRecs.take(10).foreach(println)
-    itemRecs.take(10).foreach(println)*/
   }
 
   def loadPublicData(sqlContext: SQLContext, dataPath: String): (DataFrame, Int, Int) = {
