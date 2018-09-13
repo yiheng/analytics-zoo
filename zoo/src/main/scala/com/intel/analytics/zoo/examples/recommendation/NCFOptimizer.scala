@@ -127,6 +127,7 @@ class NCFOptimizer[T: ClassTag] (
         b += 1
       }
       val dataFetchTime = System.nanoTime()
+      embeddingOptim.updateWeight(batch.getInput().asInstanceOf[Tensor[T]], embeddingWeight)
       // println("dataFetch")
       val modelTimeArray = new Array[Long](parallelism)
       val lossSum = Engine.default.invokeAndWait(
@@ -155,9 +156,6 @@ class NCFOptimizer[T: ClassTag] (
           })
       ).sum
 
-      logger.info(s"Max model time is ${modelTimeArray.max / 1e6}," +
-        s"Time is ${modelTimeArray.sortWith((a, b) => a > b).map(_ / 1e6).mkString("\t")} ms")
-
       val loss = lossSum / parallelism
 
       val computingTime = System.nanoTime()
@@ -176,7 +174,6 @@ class NCFOptimizer[T: ClassTag] (
       }
 
       val computingTime2 = System.nanoTime()
-      // println("computing2")
 
 
       // copy multi-model gradient to the buffer
@@ -224,13 +221,13 @@ class NCFOptimizer[T: ClassTag] (
         s"Throughput is ${batch.size().toDouble / (end - dataFetchTime) * 1e9} record / second. " +
         optimMethod.getHyperParameter()
         )
-      logger.info( s"data fetch time is ${(dataFetchTime - start) / 1e9}s " +
+      /*logger.info( s"data fetch time is ${(dataFetchTime - start) / 1e9}s " +
         s"model computing time is ${(computingTime - dataFetchTime) / 1e9}s " +
         s"zero grad time is ${(zeroGradTime - computingTime) / 1e9}s " +
         s"acc embedding time is ${(computingTime2 - zeroGradTime) / 1e9}s " +
         s"aggregate linear is ${(aggTime - computingTime2) / 1e9}s " +
         s"update linear time is ${(updateWeightTime1 - aggTime) / 1e9}s " +
-        s"update embedding time is ${(updateWeightTime2 - updateWeightTime1) / 1e9}s")
+        s"update embedding time is ${(updateWeightTime2 - updateWeightTime1) / 1e9}s")*/
 
       state("neval") = state[Int]("neval") + 1
 

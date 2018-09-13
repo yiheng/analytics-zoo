@@ -105,10 +105,6 @@ class ParallelAdam[@specialized(Float, Double) T: ClassTag](
       times(tid) = (System.nanoTime() - start) / 1000000L
     }))
 
-    //ParallelAdam.logger.
-    //  info(s"update ${parameter.nElement()} parameters, maximum time is ${times.max} ms")
-    //ParallelAdam.logger.info(s"Time is ${times.sortWith((a, b) => a > b).mkString("\t")} ms")
-
 
     state("evalCounter") = timestep // A tmp tensor to hold the sqrt(v) + epsilon
 
@@ -165,37 +161,5 @@ object ParallelAdam {
     _denom.cdiv(_s, _denom)
     // 3ms
     parameter.add(ev.fromType[Double](-stepSize), _denom)
-  }
-
-
-  private[optim] def updateFrameZeroGrad[T: ClassTag](
-    currentIteration: Int, lastUpdatedIteration: Int,
-    _s: Tensor[T], _r: Tensor[T], _denom: Tensor[T], _buffer: Tensor[T],
-    clr: Double, parameter: Tensor[T],
-    beta1: Double, beta2: Double,
-    ones: Tensor[T], eps: Double)(
-    implicit ev: TensorNumeric[T]): Unit = {
-
-    var timestep = lastUpdatedIteration
-    while(timestep < currentIteration) {
-      val biasCorrection1 = 1 - pow(beta1, timestep)
-      val biasCorrection2 = 1 - pow(beta2, timestep)
-      val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
-      /**
-       * m_t = beta_1 * m_t-1
-       * v_t = beta_2 * v_t-1
-       */
-      _s.mul(ev.fromType[Double](beta1))
-      _r.mul(ev.fromType[Double](beta2))
-      _denom.sqrt(_r)
-
-      // used as MKL.axpy: 1 * a + y = y
-      _denom.add(ev.fromType(eps), ones)
-
-      _denom.cdiv(_s, _denom)
-      parameter.add(ev.fromType[Double](-stepSize), _denom)
-
-      timestep += 1
-    }
   }
 }

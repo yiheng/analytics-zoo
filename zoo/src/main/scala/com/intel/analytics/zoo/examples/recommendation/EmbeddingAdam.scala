@@ -32,20 +32,23 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
   var learningRateDecay: Double = 0.0,
   var beta1: Double = 0.9,
   var beta2: Double = 0.999,
-  var eps: Double = 1e-8)(implicit ev: TensorNumeric[T]) extends OptimMethod[T] {
+  var eps: Double = 1e-8,
+  val userCount: Int = 138493,
+  val itemCount: Int = 26744,
+  val embedding1: Int = 64,
+  val embedding2: Int = 128,
+  val parallelism: Option[Int] = None
+)(implicit ev: TensorNumeric[T]) extends OptimMethod[T] {
 
-  val parallelNum = Engine.coreNumber()
+  val parallelNum = parallelism.getOrElse(Engine.coreNumber())
 
   val gradients: Array[Array[(Tensor[T], Tensor[T])]] = new Array[Array[(Tensor[T], Tensor[T])]](4)
   for(i <- 0 until 4) {
     gradients(i) = new Array[(Tensor[T], Tensor[T])](parallelNum)
   }
 
-  val userCount = 138493
-  val itemCount = 26744
-
-  val embedding1 = 64
-  val embedding2 = 128
+  val userTimestep = new Array[Int](userCount)
+  val itemTimestep = new Array[Int](itemCount)
 
   val userTaskSize = userCount / parallelNum
   val extraUserTask = userCount % parallelNum
@@ -65,9 +68,6 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
     }
   }
 
-  @transient
-  private var ones: Tensor[T] = null
-
   /**
    * An implementation of Adam http://arxiv.org/pdf/1412.6980.pdf
    *
@@ -79,8 +79,6 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
   override def optimize(feval: (Tensor[T]) => (T, Tensor[T]),
     parameter: Tensor[T]): (Tensor[T], Array[T]) = {
     MklDnn.isLoaded
-
-    val (fx, dfdx) = feval(parameter)
 
     var timestep = state.getOrElse[Int]("evalCounter", 0)
 
@@ -94,29 +92,69 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
       Affinity.setAffinity()
       val start = System.nanoTime()
       var offset = 0
-      EmbeddingAdam2.updateEmbedding(tid, itemTaskSize, extraItemTask, embedding1, parameter,
-        state[Tensor[T]](s"buffer1$tid"), clr, beta1, beta2, timestep, eps, offset, gradients(3))
+      EmbeddingAdam2.updateSparse(tid, itemTaskSize, extraItemTask, embedding1,
+        state[Tensor[T]](s"buffer1$tid"), clr, beta1, beta2, eps, gradients(3),
+        parameter, offset, itemTimestep, timestep)
       offset += itemCount * embedding1
-      EmbeddingAdam2.updateEmbedding(tid, userTaskSize, extraUserTask, embedding1, parameter,
-        state[Tensor[T]](s"buffer2$tid"), clr, beta1, beta2, timestep, eps, offset, gradients(2))
+      EmbeddingAdam2.updateSparse(tid, userTaskSize, extraUserTask, embedding1,
+        state[Tensor[T]](s"buffer2$tid"), clr, beta1, beta2, eps, gradients(2),
+        parameter, offset, userTimestep, timestep)
       offset += userCount * embedding1
-      EmbeddingAdam2.updateEmbedding(tid, itemTaskSize, extraItemTask, embedding2, parameter,
-        state[Tensor[T]](s"buffer3$tid"), clr, beta1, beta2, timestep, eps, offset, gradients(1))
+      EmbeddingAdam2.updateSparse(tid, itemTaskSize, extraItemTask, embedding2,
+        state[Tensor[T]](s"buffer3$tid"), clr, beta1, beta2, eps, gradients(1),
+        parameter, offset, null, timestep)
       offset += itemCount * embedding2
-      EmbeddingAdam2.updateEmbedding(tid, userTaskSize, extraUserTask, embedding2, parameter,
-        state[Tensor[T]](s"buffer4$tid"), clr, beta1, beta2, timestep, eps, offset, gradients(0))
+      EmbeddingAdam2.updateSparse(tid, userTaskSize, extraUserTask, embedding2,
+        state[Tensor[T]](s"buffer4$tid"), clr, beta1, beta2, eps, gradients(0),
+        parameter, offset, null, timestep)
 
       times(tid) = (System.nanoTime() - start) / 1000000
     }))
 
-    // EmbeddingAdam2.logger.
-    //  info(s"update ${parameter.nElement()} parameters, maximum time is ${times.max} ms")
-    //EmbeddingAdam2.logger.info(s"Time is ${times.sortWith((a, b) => a > b).mkString("\t")} ms")
-    EmbeddingAdam2.logger.info(s"optim method time is ${(System.nanoTime() - start) / 1e6}ms")
-
     state("evalCounter") = timestep // A tmp tensor to hold the sqrt(v) + epsilon
 
-    (parameter, Array(fx))
+    (parameter, null)
+  }
+
+  def updateWeight(indexes: Tensor[T], parameter: Tensor[T]): Unit = {
+    // first column is user, the second column is item
+    val indexData = indexes.storage().array()
+    val indexOffset = indexes.storageOffset() - 1
+    val indexLength = indexes.nElement()
+    val userRecord = new mutable.HashSet[Int]()
+    val itemRecord = new mutable.HashSet[Int]()
+    var i = 0
+    while(i < indexLength) {
+      userRecord.add(ev.toType[Int](indexData(i + indexOffset)))
+      itemRecord.add(ev.toType[Int](indexData(i + indexOffset + 1)))
+      i += 2
+    }
+
+    val timestep = state.getOrElse[Int]("evalCounter", 0)
+    val clr = learningRate / (1 + timestep*learningRateDecay)
+
+    Engine.default.invokeAndWait((0 until parallelNum).map(tid => () => {
+      Affinity.setAffinity()
+      val start = System.nanoTime()
+      var offset = 0
+      EmbeddingAdam2.lazyUpdate(itemRecord, tid, itemTaskSize, extraItemTask, embedding1, parameter,
+        state[Tensor[T]](s"buffer1$tid"), clr, beta1, beta2, eps, offset,
+        itemTimestep, timestep)
+      offset += itemCount * embedding1
+      EmbeddingAdam2.lazyUpdate(userRecord, tid, userTaskSize, extraUserTask, embedding1, parameter,
+        state[Tensor[T]](s"buffer2$tid"), clr, beta1, beta2, eps, offset,
+        userTimestep, timestep)
+      offset += userCount * embedding1
+      EmbeddingAdam2.lazyUpdate(itemRecord, tid, itemTaskSize, extraItemTask, embedding2, parameter,
+        state[Tensor[T]](s"buffer3$tid"), clr, beta1, beta2, eps, offset,
+        itemTimestep, timestep)
+      offset += itemCount * embedding2
+      EmbeddingAdam2.lazyUpdate(userRecord, tid, userTaskSize, extraUserTask, embedding2, parameter,
+        state[Tensor[T]](s"buffer4$tid"), clr, beta1, beta2, eps, offset,
+        userTimestep, timestep)
+
+      times(tid) = (System.nanoTime() - start) / 1000000
+    }))
   }
 
   override def loadFromTable(config: Table): this.type = {
@@ -140,49 +178,45 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
 object EmbeddingAdam2 {
   val logger = Logger.getLogger(this.getClass)
 
-  private[optim] def updateEmbedding[T: ClassTag](
+  private[optim] def updateSparse[T: ClassTag](
     tid: Int,
     taskSize: Int,
     extraTask: Int,
     embedding: Int,
-    parameter: Tensor[T],
     buffer: Tensor[T],
     clr: Double,
     beta1: Double,
     beta2: Double,
-    timestep: Int,
     eps: Double,
-    totalOffset: Int,
-    gradient: Array[(Tensor[T], Tensor[T])]
+    gradient: Array[(Tensor[T], Tensor[T])],
+    parameter: Tensor[T],
+    parameterOffset: Int,
+    timestamps: Array[Int],
+    timestamp: Int
   )(implicit ev: TensorNumeric[T]): Unit = {
-    val offset = (tid * taskSize + math.min(tid, extraTask)) * embedding
-    val length = (taskSize + (if (tid < extraTask) 1 else 0)) * embedding
-    val currentParameter = parameter.narrow(1, totalOffset + offset + 1, length)
+    val idStart = tid * taskSize + math.min(tid, extraTask)
+    val idLength = taskSize + (if (tid < extraTask) 1 else 0)
+    val offset = idStart * embedding
+    val length = idLength * embedding
     val _s = buffer.narrow(1, 1, length)
-    val _r = buffer.narrow(1, length, length)
-    val _denom = buffer.narrow(1, 2 * length, length)
+    val _r = buffer.narrow(1, length + 1, length)
+    val _denom = buffer.narrow(1, 2 * length + 1, embedding)
 
-    EmbeddingAdam2.updateSparse(_s, _denom, _r, beta1, beta2, offset, length, gradient)
-    EmbeddingAdam2.updateFrame(_s, _r, _denom, clr, null, currentParameter,
-      beta1, beta2, timestep, null, eps)
-  }
-
-  private[optim] def updateSparse[T: ClassTag](_s: Tensor[T], _denom: Tensor[T], _r: Tensor[T],
-    beta1: Double, beta2: Double, offset: Int, length: Int,
-    gradient: Array[(Tensor[T], Tensor[T])])(implicit ev: TensorNumeric[T]): Unit = {
-    val record = new ArrayBuffer[(Int, Int, Int)]()
+    val record = new ArrayBuffer[(Int, Int, Int, Int)]()
     var i = 0
     while(i < gradient.length) {
       val indexes = gradient(i)._1
       val values = gradient(i)._2
-      val embedding = values.size(2)
       val indexData = indexes.storage().array()
       val indexOffset = indexes.storageOffset() - 1
       var j = 0
       while(j < indexes.size(1)) {
-        val curOffset = ev.toType[Int](indexData(indexOffset + 1)) * embedding - offset
-        if (curOffset > 0 && curOffset < length) {
-          record.append((curOffset, i, j))
+        val ind = ev.toType[Int](indexData(indexOffset + j)) - 1
+        if (timestamps != null) {
+          timestamps(ind) = timestamp
+        }
+        if (ind >= idStart && ind < idLength + idStart) {
+          record.append((ind * embedding - offset, i, j, ind))
         }
         j += 1
       }
@@ -192,78 +226,106 @@ object EmbeddingAdam2 {
     i = 0
     while(i < recordArray.length) {
       val values = gradient(recordArray(i)._2)._2
-      val embedding = values.size(2)
-      val _denomTmp = _denom.narrow(1, 1, embedding)
       val dfdx = values.select(1, recordArray(i)._3 + 1)
-      _s.narrow(1, recordArray(i)._1, embedding)
+      val curS = _s.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta1))
         .add(ev.fromType[Double](1 - beta1), dfdx)
-      _denomTmp.cmul(dfdx, dfdx)
-      _r.narrow(1, recordArray(i)._1, embedding)
-        .add(ev.fromType[Double](1 - beta2), _denomTmp)
+      _denom.cmul(dfdx, dfdx)
+      val curR = _r.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta2))
+        .add(ev.fromType[Double](1 - beta2), _denom)
+      _denom.sqrt(curR)
+      _denom.add(ev.fromType(eps))
+      val biasCorrection1 = 1 - pow(beta1, timestamp)
+      val biasCorrection2 = 1 - pow(beta2, timestamp)
+      val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
+      _denom.cdiv(curS, _denom)
+      parameter.narrow(1, parameterOffset + recordArray(i)._4 * embedding + 1, embedding)
+        .add(ev.fromType[Double](-stepSize), _denom)
       i += 1
     }
   }
 
-  private[optim] def updateFrame[T: ClassTag](
-    _s: Tensor[T], _r: Tensor[T], _denom: Tensor[T],
-    clr: Double, dfdx: Tensor[T], parameter: Tensor[T],
-    beta1: Double, beta2: Double, timestep: Int,
-    ones: Tensor[T], eps: Double)(implicit ev: TensorNumeric[T]): Unit = {
-    /**
-     * m_t = beta_1 * m_t-1 + (1 - beta_1) * g_t
-     * v_t = beta_2 * v_t-1 + (1 - beta_2) * g_t * g_t
-     */
-    // 7ms ~ 10ms
-    _s.mul(ev.fromType[Double](beta1))// .add(ev.fromType[Double](1-beta1), dfdx)
-    // _denom.cmul(dfdx, dfdx)
+  private[optim] def lazyUpdate[T: ClassTag](
+    record: mutable.HashSet[Int],
+    tid: Int,
+    taskSize: Int,
+    extraTask: Int,
+    embedding: Int,
+    parameter: Tensor[T],
+    buffer: Tensor[T],
+    clr: Double,
+    beta1: Double,
+    beta2: Double,
+    eps: Double,
+    parameterOffset: Int,
+    timestamps: Array[Int],
+    timestamp: Int)(implicit ev: TensorNumeric[T]): Unit = {
 
-    // 10ms
-    _r.mul(ev.fromType[Double](beta2))// .add(ev.fromType[Double](1-beta2), _denom)
-    _denom.sqrt(_r)
+    val idStart = (tid * taskSize + math.min(tid, extraTask))
+    val idLength = (taskSize + (if (tid < extraTask) 1 else 0))
 
-    // used as MKL.axpy: 1 * a + y = y, and fill buffer with one
-    // 2ms
-    _denom.add(ev.fromType(eps))
+    val iter = record.iterator
+    while(iter.hasNext) {
+      val id = iter.next() - 1
+      if (id >= idStart && id < idStart + idLength) {
+        val lastTimestamp = timestamps(id)
+        val t = timestamp - lastTimestamp
+        require(t >= 0, s"t is $t")
+        if (t > 0 && lastTimestamp != 0) {
+          val currentParameter = parameter.narrow(1, parameterOffset + id * embedding + 1, embedding)
+          val _s = buffer.narrow(1, (id - idStart) * embedding + 1, embedding)
+          val _r = buffer.narrow(1, (idLength + id - idStart) * embedding + 1, embedding)
+          val _denom = buffer.narrow(1, (2 * idLength + id - idStart) * embedding + 1, embedding)
+          _denom.sqrt(_r)
+          _denom.add(ev.fromType(eps))
+          _denom.cdiv(_s, _denom)
 
-    // efficiency improved upon by changing the order of computation, at expense of clarity
-    // 3ms
-    val biasCorrection1 = 1 - pow(beta1, timestep)
-    val biasCorrection2 = 1 - pow(beta2, timestep)
-    val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
-    _denom.cdiv(_s, _denom)
-    // 3ms
-    parameter.add(ev.fromType[Double](-stepSize), _denom)
-  }
+          var i = lastTimestamp + 1
+          var stepSizeSum = 0.0
+          while(i <= timestamp) {
+            val biasCorrection1 = 1 - pow1N(i)
+            val biasCorrection2 = 1 - pow2N(i)
+            val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
+            val b1 = pow1N(i - lastTimestamp)
+            val b2 = pow2N(i - lastTimestamp)
+            stepSizeSum += stepSize * b1 / sqrt(b2)
+            i += 1
+          }
+          currentParameter.add(ev.fromType[Double](-stepSizeSum), _denom)
 
-
-  private[optim] def updateFrameZeroGrad[T: ClassTag](
-    currentIteration: Int, lastUpdatedIteration: Int,
-    _s: Tensor[T], _r: Tensor[T], _denom: Tensor[T], _buffer: Tensor[T],
-    clr: Double, parameter: Tensor[T],
-    beta1: Double, beta2: Double,
-    ones: Tensor[T], eps: Double)(
-    implicit ev: TensorNumeric[T]): Unit = {
-
-    var timestep = lastUpdatedIteration
-    while(timestep < currentIteration) {
-      val biasCorrection1 = 1 - pow(beta1, timestep)
-      val biasCorrection2 = 1 - pow(beta2, timestep)
-      val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
-      /**
-       * m_t = beta_1 * m_t-1
-       * v_t = beta_2 * v_t-1
-       */
-      _s.mul(ev.fromType[Double](beta1))
-      _r.mul(ev.fromType[Double](beta2))
-      _denom.sqrt(_r)
-
-      // used as MKL.axpy: 1 * a + y = y
-      _denom.add(ev.fromType(eps), ones)
-
-      _denom.cdiv(_s, _denom)
-      parameter.add(ev.fromType[Double](-stepSize), _denom)
-
-      timestep += 1
+          val beta1t = pow1N(timestamp - lastTimestamp)
+          val beta2t = pow2N(timestamp - lastTimestamp)
+          _s.mul(ev.fromType(beta1t))
+          _r.mul(ev.fromType(beta2t))
+        }
+      }
     }
   }
+
+  @inline
+  private def pow1N(n: Int): Double = {
+    require(n > 0 && n < cap)
+    beta1Powers(n)
+  }
+
+  @inline
+  private def pow2N(n: Int): Double = {
+    require(n < cap)
+    beta2Powers(n)
+  }
+
+  val beta1: Double = 0.9
+  val beta2: Double = 0.999
+  val cap = 1000000
+  val beta1Powers = new Array[Double](cap)
+  beta1Powers(0) = 1
+  val beta2Powers = new Array[Double](cap)
+  beta2Powers(0) = 1
+  println("init power start")
+  var i = 1
+  while(i < cap) {
+    beta1Powers(i) = beta1Powers(i - 1) * beta1
+    beta2Powers(i) = beta2Powers(i - 1) * beta2
+    i += 1
+  }
+  println("init power done")
 }
