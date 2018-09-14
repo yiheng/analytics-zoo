@@ -36,8 +36,51 @@ class EmbeddingAdamSpec extends ZooSpecHelper {
       userCount * embedding2
     val weight1 = Tensor[Float](length).fill(1.0f)
     val weight2 = weight1.clone()
-    testAdam.gradients(3)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 1.0, 1.0))))
-    testAdam.gradients(2)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 1.0, 1.0))))
+
+    MklDnn.isLoaded
+    testAdam.updateWeight(Tensor[Float](T(1.0, 1.0)), weight1)
+    testAdam.gradients(3)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 2.0, 3.0))))
+    testAdam.gradients(2)(0) = (Tensor[Float](T(2.0)), Tensor[Float](T(T(1.0, 2.0, 3.0))))
+    testAdam.gradients(1)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 1.0, 1.0, 1.0))))
+    testAdam.gradients(0)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 1.0, 1.0, 1.0))))
+    testAdam.optimize(null, weight1)
+
+    var offset = 0
+    val denseGradient = weight1.clone().zero()
+    denseGradient.setValue(offset + 1, 1.0f)
+    denseGradient.setValue(offset + 2, 2.0f)
+    denseGradient.setValue(offset + 3, 3.0f)
+    offset += itemCount * embedding1
+    denseGradient.setValue(offset + 4, 1.0f)
+    denseGradient.setValue(offset + 5, 2.0f)
+    denseGradient.setValue(offset + 6, 3.0f)
+    offset += userCount * embedding1
+    denseGradient.narrow(1, offset + 1, 4).fill(1.0f)
+    offset += itemCount * embedding2
+    denseGradient.narrow(1, offset + 1, 4).fill(1.0f)
+
+    refAdam.optimize(_ => (1.0f, denseGradient), weight2)
+    weight1 should be(weight2)
+  }
+
+  "adam result" should "be same for one update with multiple ids" in {
+    System.setProperty("bigdl.localMode", "true")
+    Engine.init
+    val userCount = 10
+    val itemCount = 5
+    val embedding1 = 3
+    val embedding2 = 4
+    val testAdam = new EmbeddingAdam2[Float](userCount = userCount, itemCount = itemCount,
+      embedding1 = embedding1, embedding2 = embedding2, parallelism = Some(1))
+    val refAdam = new Adam[Float]()
+    val length = itemCount * embedding1 + userCount * embedding1 + itemCount * embedding2 +
+      userCount * embedding2
+    val weight1 = Tensor[Float](length).fill(1.0f)
+    val weight2 = weight1.clone()
+    testAdam.gradients(3)(0) = (Tensor[Float](T(1.0, 1.0)),
+      Tensor[Float](T(T(1.0, 2.0, 3.0), T(2.0, 3.0, 4.0))))
+    testAdam.gradients(2)(0) = (Tensor[Float](T(1.0, 2.0)),
+      Tensor[Float](T(T(1.0, 2.0, 3.0), T(2.0, 3.0, 4.0))))
     testAdam.gradients(1)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 1.0, 1.0, 1.0))))
     testAdam.gradients(0)(0) = (Tensor[Float](T(1.0)), Tensor[Float](T(T(1.0, 1.0, 1.0, 1.0))))
     MklDnn.isLoaded
@@ -46,9 +89,17 @@ class EmbeddingAdamSpec extends ZooSpecHelper {
 
     var offset = 0
     val denseGradient = weight1.clone().zero()
-    denseGradient.narrow(1, offset + 1, 3).fill(1.0f)
+    denseGradient.setValue(offset + 1, 1.5f)
+    denseGradient.setValue(offset + 2, 2.5f)
+    denseGradient.setValue(offset + 3, 3.5f)
     offset += itemCount * embedding1
-    denseGradient.narrow(1, offset + 1, 3).fill(1.0f)
+    denseGradient.narrow(1, offset + 1, 3)
+    denseGradient.setValue(offset + 1, 1.0f)
+    denseGradient.setValue(offset + 2, 2.0f)
+    denseGradient.setValue(offset + 3, 3.0f)
+    denseGradient.setValue(offset + 4, 2.0f)
+    denseGradient.setValue(offset + 5, 3.0f)
+    denseGradient.setValue(offset + 6, 4.0f)
     offset += userCount * embedding1
     denseGradient.narrow(1, offset + 1, 4).fill(1.0f)
     offset += itemCount * embedding2

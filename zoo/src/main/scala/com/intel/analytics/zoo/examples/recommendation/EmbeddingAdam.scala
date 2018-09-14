@@ -212,10 +212,10 @@ object EmbeddingAdam2 {
       var j = 0
       while(j < indexes.size(1)) {
         val ind = ev.toType[Int](indexData(indexOffset + j)) - 1
-        if (timestamps != null) {
-          timestamps(ind) = timestamp
-        }
         if (ind >= idStart && ind < idLength + idStart) {
+          if (timestamps != null) {
+            timestamps(ind) = timestamp
+          }
           record.append((ind * embedding - offset, i, j, ind))
         }
         j += 1
@@ -223,23 +223,31 @@ object EmbeddingAdam2 {
       i += 1
     }
     val recordArray = record.toArray.sortWith(_._1 < _._1)
+    val dfdx = Tensor[T](embedding)
+    var count = 0
     i = 0
     while(i < recordArray.length) {
       val values = gradient(recordArray(i)._2)._2
-      val dfdx = values.select(1, recordArray(i)._3 + 1)
-      val curS = _s.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta1))
-        .add(ev.fromType[Double](1 - beta1), dfdx)
-      _denom.cmul(dfdx, dfdx)
-      val curR = _r.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta2))
-        .add(ev.fromType[Double](1 - beta2), _denom)
-      _denom.sqrt(curR)
-      _denom.add(ev.fromType(eps))
-      val biasCorrection1 = 1 - pow(beta1, timestamp)
-      val biasCorrection2 = 1 - pow(beta2, timestamp)
-      val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
-      _denom.cdiv(curS, _denom)
-      parameter.narrow(1, parameterOffset + recordArray(i)._4 * embedding + 1, embedding)
-        .add(ev.fromType[Double](-stepSize), _denom)
+      dfdx.add(values.select(1, recordArray(i)._3 + 1))
+      count += 1
+      if (i == recordArray.length - 1 || recordArray(i)._4 != recordArray(i + 1)._4) {
+        dfdx.div(ev.fromType(count))
+        val curS = _s.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta1))
+          .add(ev.fromType[Double](1 - beta1), dfdx)
+        _denom.cmul(dfdx, dfdx)
+        val curR = _r.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta2))
+          .add(ev.fromType[Double](1 - beta2), _denom)
+        _denom.sqrt(curR)
+        _denom.add(ev.fromType(eps))
+        val biasCorrection1 = 1 - pow(beta1, timestamp)
+        val biasCorrection2 = 1 - pow(beta2, timestamp)
+        val stepSize = clr * sqrt(biasCorrection2) / biasCorrection1
+        _denom.cdiv(curS, _denom)
+        parameter.narrow(1, parameterOffset + recordArray(i)._4 * embedding + 1, embedding)
+          .add(ev.fromType[Double](-stepSize), _denom)
+        dfdx.zero()
+        count = 0
+      }
       i += 1
     }
   }
