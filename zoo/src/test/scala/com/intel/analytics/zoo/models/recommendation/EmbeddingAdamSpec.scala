@@ -34,7 +34,7 @@ class EmbeddingAdamSpec extends ZooSpecHelper {
     val refAdam = new Adam[Float]()
     val length = itemCount * embedding1 + userCount * embedding1 + itemCount * embedding2 +
       userCount * embedding2
-    val weight1 = Tensor[Float](length).fill(1.0f)
+    val weight1 = Tensor[Float](length).randn()
     val weight2 = weight1.clone()
 
     MklDnn.isLoaded

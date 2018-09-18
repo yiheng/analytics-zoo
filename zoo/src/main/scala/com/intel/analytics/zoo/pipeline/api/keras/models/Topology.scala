@@ -865,7 +865,7 @@ private[zoo] class InternalLocalOptimizer[T: ClassTag] (
     criterion: Criterion[T]
 )(implicit ev: TensorNumeric[T]) extends LocalOptimizer[T](model, ds, criterion) {
 
-  def setTrainData(trainingDataSet: DataSet[MiniBatch[T]]): this.type = {
+  override def setTrainData(trainingDataSet: DataSet[MiniBatch[T]]): this.type = {
      this.dataset = trainingDataSet
     this.endEpoch()
     this
@@ -885,7 +885,7 @@ private[zoo] class InternalDistriOptimizer[T: ClassTag] (
     _criterion: Criterion[T]
 )(implicit ev: TensorNumeric[T]) extends DistriOptimizer[T](_model, _dataset, _criterion) {
 
-  def setTrainData(trainingDataSet: DataSet[MiniBatch[T]]): this.type = {
+  override def setTrainData(trainingDataSet: DataSet[MiniBatch[T]]): this.type = {
     this.dataset = trainingDataSet
     InternalOptimizerUtil.endEpoch(this)
     this

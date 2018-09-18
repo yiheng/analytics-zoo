@@ -129,7 +129,7 @@ object WideAndDeepExample {
     val ratings = sqlContext.read.text(dataPath + "/ratings.dat").as[String]
       .map(x => {
         val line = x.split("::").map(n => n.toInt)
-        Rating(line(0), line(1), line(2))
+        Rating(line(0).toInt, line(1).toInt, line(2).toInt, line(3).toInt, true)
       }).toDF()
     val userDF = sqlContext.read.text(dataPath + "/users.dat").as[String]
       .map(x => {

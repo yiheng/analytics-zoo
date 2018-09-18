@@ -33,21 +33,20 @@ import scala.reflect.ClassTag
 /**
  * Optimize a model on a single machine
  *
- * @param model model to be optimized
- * @param dataset data set
- * @param criterion criterion to be used
+ * @param _model model to be optimized
+ * @param _dataset data set
+ * @param _criterion criterion to be used
  */
-class NCFOptimizer[T: ClassTag] (
-  model: Module[T],
-  dataset: LocalDataSet[MiniBatch[T]],
-  criterion: Criterion[T]
+class NCFOptimizer2[T: ClassTag](
+  _model: Module[T],
+  _dataset: LocalDataSet[MiniBatch[T]],
+  _criterion: Criterion[T]
 )(implicit ev: TensorNumeric[T])
   extends Optimizer[T, MiniBatch[T]](
-    model, dataset, criterion) {
+    _model, _dataset, _criterion) {
 
-  import NCFOptimizer.initModel
+  import NCFOptimizer2._
   import Optimizer._
-  import NCFOptimizer.logger
 
   private val coreNumber = Engine.coreNumber()
 
@@ -56,28 +55,36 @@ class NCFOptimizer[T: ClassTag] (
     case _ => throw new IllegalArgumentException
   }
 
-  val ncfModel = model.asInstanceOf[NeuralCFV2[T]]
+  val ncfModel = _model.asInstanceOf[NeuralCFV2[T]]
 
   // TODO: sharing failed
-  private val workingEmbeddingModels = initModel(ncfModel.embeddingModel,
+  val workingEmbeddingModels = initModel(ncfModel.embeddingModel,
     subModelNumber, true)
-  private val workingLinears = initModel(ncfModel.ncfLayers,
+  val workingLinears = initModel(ncfModel.ncfLayers,
     subModelNumber, false)
 
-  workingEmbeddingModels(0).parameters()._2.apply(0).setValue(1, 1, ev.fromType(0.01f))
-  workingEmbeddingModels(0).parameters()._1.apply(0).setValue(1, 1, ev.fromType(1.01f))
+//  workingEmbeddingModels(0).parameters()._2.apply(0).setValue(1, 1, ev.fromType(0.01f))
+//  workingEmbeddingModels(0).parameters()._1.apply(0).setValue(1, 1, ev.fromType(1.01f))
 
-  workingEmbeddingModels(0).getParameters()._2.setValue(1, ev.fromType(0.1f))
-  workingEmbeddingModels(0).getParameters()._1.setValue(1, ev.fromType(1.1f))
-  private val (embeddingWeight, embeddingGrad) = ncfModel.embeddingModel.getParameters()
-  private val (linearsWeight, linearsGrad) = ncfModel.ncfLayers.getParameters()
-  workingEmbeddingModels(0).getParameters()._2.setValue(1, ev.fromType(0.2f))
-  workingEmbeddingModels(0).getParameters()._1.setValue(1, ev.fromType(1.2f))
+  val (embeddingWeight, embeddingGrad) = ncfModel.embeddingModel.getParameters()
+  val (linearsWeight, linearsGrad) = ncfModel.ncfLayers.getParameters()
 
-  private val workingEmbeddingModelWAndG = workingEmbeddingModels.map(_.getParameters())
-  private val workingLinearModelWAndG = workingLinears.map(_.getParameters())
+  val workingEmbeddingModelWAndG = workingEmbeddingModels.map(_.getParameters())
+
+//  embeddingWeight.setValue(1, ev.fromType(0.123f))
+//  workingEmbeddingModelWAndG.foreach(_._1.set(embeddingWeight))
+//  workingEmbeddingModelWAndG.foreach(_._2.set(embeddingGrad))
+
+//  workingEmbeddingModels(0).parameters()._2.apply(0).setValue(1, 1, ev.fromType(0.02f))
+//  workingEmbeddingModels(0).parameters()._1.apply(0).setValue(1, 1, ev.fromType(1.02f))
+
+  val workingLinearModelWAndG = workingLinears.map(_.getParameters())
+//  workingLinearModelWAndG.foreach(_._1.set(linearsWeight))
+//  workingLinearModelWAndG(0)._1.setValue(1, ev.fromType(0.222f))
+
 
   private val linearGradLength = linearsGrad.nElement()
+
   private val linearSyncGradTaskSize = linearGradLength / subModelNumber
   private val linearSyncGradExtraTask = linearGradLength % subModelNumber
   private val linearSyncGradParallelNum =
@@ -90,25 +97,23 @@ class NCFOptimizer[T: ClassTag] (
     if (embeddingSyncGradTaskSize == 0) linearSyncGradExtraTask else subModelNumber
 
   private val workingCriterion =
-    (1 to subModelNumber).map(_ => criterion.cloneCriterion()).toArray
-
-  var embeddingOptim: EmbeddingAdam2[T] = _
+    (1 to subModelNumber).map(_ => _criterion.cloneCriterion()).toArray
 
   override def optimize(): Module[T] = {
     MklDnn.isLoaded
     var wallClockTime = 0L
     var count = 0
-    optimMethods.values.foreach { optimMethod =>
-      optimMethod.clearHistory()
-    }
+//    optimMethods.values.foreach { optimMethod =>
+//      optimMethod.clearHistory()
+//    }
     state("epoch") = state.get[Int]("epoch").getOrElse(1)
     state("neval") = state.get[Int]("neval").getOrElse(1)
-    state("isLayerwiseScaled") = Utils.isLayerwiseScaled(model)
-    val optimMethod: OptimMethod[T] = optimMethods(model.getName())
-
-    dataset.shuffle()
-    val numSamples = dataset.data(train = false).map(_.size()).reduce(_ + _)
-    var iter = dataset.data(train = true)
+    state("isLayerwiseScaled") = Utils.isLayerwiseScaled(_model)
+    val optimMethod: OptimMethod[T] = optimMethods("linears")
+    val embeddingOptim: EmbeddingAdam2[T] = optimMethods("embeddings").asInstanceOf[EmbeddingAdam2[T]]
+//    dataset.shuffle()
+    val numSamples = dataset.toLocal().data(train = false).map(_.size()).reduce(_ + _)
+    var iter = dataset.toLocal().data(train = true)
     logger.info("model thread pool size is " + Engine.model.getPoolSize)
     while (!endWhen(state)) {
       val start = System.nanoTime()
@@ -133,7 +138,6 @@ class NCFOptimizer[T: ClassTag] (
       val lossSum = Engine.default.invokeAndWait(
         (0 until parallelism).map(i =>
           () => {
-            // Affinity.setAffinity()
             val start = System.nanoTime()
             val localEmbedding = workingEmbeddingModels(i)
             val localLinears = workingLinears(i)
@@ -155,6 +159,9 @@ class NCFOptimizer[T: ClassTag] (
             _loss
           })
       ).sum
+
+      logger.debug(s"Max model time is ${modelTimeArray.max}," +
+        s"Time is ${modelTimeArray.sortWith((a, b) => a > b).mkString("\t")} ms")
 
       val loss = lossSum / parallelism
 
@@ -195,6 +202,7 @@ class NCFOptimizer[T: ClassTag] (
             }
           })
       )
+      linearsGrad.div(ev.fromType(parallelism))
 
       val aggTime = System.nanoTime()
       //println("agg")
@@ -233,7 +241,7 @@ class NCFOptimizer[T: ClassTag] (
 
       if (count >= numSamples) {
         state("epoch") = state[Int]("epoch") + 1
-        dataset.shuffle()
+//        dataset.shuffle()
         iter = dataset.toLocal().data(train = true)
         count = 0
       }
@@ -241,9 +249,22 @@ class NCFOptimizer[T: ClassTag] (
       validate(head)
       checkpoint(wallClockTime)
     }
+    ncfModel.embeddingModel.getParameters()._1.copy(embeddingWeight)
+    ncfModel.ncfLayers.getParameters()._1.copy(linearsWeight)
 
-    model
+    _model
   }
+
+  /**
+   * Set new train dataset
+   * @param trainDataset new train dataset
+   * @return
+   */
+  def setTrainData(trainDataset: LocalDataSet[MiniBatch[T]]): this.type = {
+    dataset = trainDataset
+    this
+  }
+
 
   private def checkpoint(wallClockTime: Long): Unit = {
     if (checkpointTrigger.isEmpty || checkpointPath.isEmpty) {
@@ -252,91 +273,96 @@ class NCFOptimizer[T: ClassTag] (
 
     val trigger = checkpointTrigger.get
     if (trigger(state) && checkpointPath.isDefined) {
-      logger.debug(s"[Wall Clock ${wallClockTime / 1e9}s] Save model to path")
-      saveModel(model, checkpointPath, isOverWrite, s".${state[Int]("neval")}")
+      logger.info(s"[Wall Clock ${wallClockTime / 1e9}s] Save model to path")
+      saveModel(_model, checkpointPath, isOverWrite, s".${state[Int]("neval")}")
       saveState(state, checkpointPath, isOverWrite, s".${state[Int]("neval")}")
     }
   }
 
   private def validate(header: String): Unit = {
-//    if (validationTrigger.isEmpty || validationDataSet.isEmpty) {
-//      return
-//    }
-//    val trigger = validationTrigger.get
-//    if (!trigger(state)) {
-//      return
-//    }
-//    val vMethods = validationMethods.get
-//    val vMethodsArr = (1 to subModelNumber).map(i => vMethods.map(_.clone())).toArray
-//    val dataIter = validationDataSet.get.toLocal().data(train = false)
-//    logger.info(s"$header Validate model...")
-//
-//    workingModels.foreach(_.evaluate())
-//
-//    var count = 0
-//    dataIter.map(batch => {
-//      val stackSize = batch.size() / subModelNumber
-//      val extraSize = batch.size() % subModelNumber
-//      val parallelism = if (stackSize == 0) extraSize else subModelNumber
-//      val start = System.nanoTime()
-//      val result = Engine.default.invokeAndWait(
-//        (0 until parallelism).map(b =>
-//          () => {
-//            val offset = b * stackSize + math.min(b, extraSize) + 1
-//            val length = stackSize + (if (b < extraSize) 1 else 0)
-//            val currentMiniBatch = batch.slice(offset, length)
-//            val input = currentMiniBatch.getInput()
-//            val target = currentMiniBatch.getTarget()
-//            val output = workingModels(b).forward(input)
-//            val validatMethods = vMethodsArr(b)
-//            validatMethods.map(validation => {
-//              validation(output, target)
-//            })
-//          }
-//        )
-//      ).reduce((left, right) => {
-//        left.zip(right).map { case (l, r) =>
-//          l + r
-//        }
-//      })
-//      count += batch.size()
-//      logger.info(s"$header Throughput is ${
-//        batch.size() / ((System.nanoTime() - start) / 1e9)
-//      } record / sec")
-//      result
-//    }).reduce((left, right) => {
-//      left.zip(right).map { case (l, r) =>
-//        l + r
-//      }
-//    }).zip(vMethods).foreach(r => {
-//      logger.info(s"$header ${r._2} is ${r._1}")
-//    })
+    if (validationTrigger.isEmpty || validationDataSet.isEmpty) {
+      return
+    }
+    val trigger = validationTrigger.get
+    if (!trigger(state)) {
+      return
+    }
+    val vMethods = validationMethods.get
+    val vMethodsArr = (1 to subModelNumber).map(i => vMethods.map(_.clone())).toArray
+    val dataIter = validationDataSet.get.toLocal().data(train = false)
+    logger.info(s"$header Validate model...")
+
+    var count = 0
+    val start = System.nanoTime()
+    dataIter.map(batch => {
+      val stackSize = batch.size() / subModelNumber
+      val extraSize = batch.size() % subModelNumber
+      val parallelism = if (stackSize == 0) extraSize else subModelNumber
+      val result = Engine.default.invokeAndWait(
+        (0 until parallelism).map(b =>
+          () => {
+            val offset = b * stackSize + math.min(b, extraSize) + 1
+            val length = stackSize + (if (b < extraSize) 1 else 0)
+            val currentMiniBatch = batch.slice(offset, length)
+
+            val localEmbedding = workingEmbeddingModels(b)
+            val localLinears = workingLinears(b)
+            localEmbedding.evaluate()
+            localLinears.evaluate()
+            val input = currentMiniBatch.getInput()
+            val target = currentMiniBatch.getTarget()
+
+            val embeddingOutput = localEmbedding.forward(input)
+            val output = localLinears.forward(embeddingOutput)
+
+            val validatMethods = vMethodsArr(b)
+            validatMethods.map(validation => {
+              validation(output, target)
+            })
+          }
+        )
+      ).reduce((left, right) => {
+        left.zip(right).map { case (l, r) =>
+          l + r
+        }
+      })
+      count += batch.size()
+      result
+    }).reduce((left, right) => {
+      left.zip(right).map { case (l, r) =>
+        l + r
+      }
+    }).zip(vMethods).foreach(r => {
+      logger.info(s"$header ${r._2} is ${r._1}")
+    })
+    logger.info(s"$header Throughput is ${
+      count / ((System.nanoTime() - start) / 1e9)
+    } record / sec")
   }
 }
 
-object NCFOptimizer {
+object NCFOptimizer2 {
   val logger = Logger.getLogger(this.getClass)
 
   def initModel[T: ClassTag](model: Module[T], copies: Int,
                              shareGradient: Boolean)(
       implicit ev: TensorNumeric[T]): Array[Module[T]] = {
+    model.getParameters()
     val (wb, grad) = Util.getAndClearWeightBiasGrad(model.parameters())
 
     val models = (1 to copies).map(i => {
       logger.info(s"Clone $i model...")
-      val m = if (i == copies) {
-        model
-      } else {
-        model.cloneModule()
-      }
+      val m: Module[T] = model.cloneModule()
       Util.putWeightBias(wb, m)
       if (shareGradient) {
         Util.putGradWeightBias(grad, m)
       } else {
-        Util.initGradWeightBias(wb, m)
+        Util.initGradWeightBias(grad, m)
       }
       m
     }).toArray
+    Util.putWeightBias(wb, model)
+    Util.putGradWeightBias(grad, model)
     models
   }
 }

@@ -40,6 +40,7 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
   val parallelism: Option[Int] = None
 )(implicit ev: TensorNumeric[T]) extends OptimMethod[T] {
 
+  val modelParallelism = Engine.coreNumber() // model parallelism, average gradient
   val parallelNum = parallelism.getOrElse(Engine.coreNumber())
 
   val gradients: Array[Array[(Tensor[T], Tensor[T])]] = new Array[Array[(Tensor[T], Tensor[T])]](4)
@@ -94,19 +95,19 @@ class EmbeddingAdam2[@specialized(Float, Double) T: ClassTag](
       var offset = 0
       EmbeddingAdam2.updateSparse(tid, itemTaskSize, extraItemTask, embedding1,
         state[Tensor[T]](s"buffer1$tid"), clr, beta1, beta2, eps, gradients(3),
-        parameter, offset, itemTimestep, timestep)
+        parameter, offset, itemTimestep, timestep, modelParallelism)
       offset += itemCount * embedding1
       EmbeddingAdam2.updateSparse(tid, userTaskSize, extraUserTask, embedding1,
         state[Tensor[T]](s"buffer2$tid"), clr, beta1, beta2, eps, gradients(2),
-        parameter, offset, userTimestep, timestep)
+        parameter, offset, userTimestep, timestep, modelParallelism)
       offset += userCount * embedding1
       EmbeddingAdam2.updateSparse(tid, itemTaskSize, extraItemTask, embedding2,
         state[Tensor[T]](s"buffer3$tid"), clr, beta1, beta2, eps, gradients(1),
-        parameter, offset, null, timestep)
+        parameter, offset, null, timestep, modelParallelism)
       offset += itemCount * embedding2
       EmbeddingAdam2.updateSparse(tid, userTaskSize, extraUserTask, embedding2,
         state[Tensor[T]](s"buffer4$tid"), clr, beta1, beta2, eps, gradients(0),
-        parameter, offset, null, timestep)
+        parameter, offset, null, timestep, modelParallelism)
 
       times(tid) = (System.nanoTime() - start) / 1000000
     }))
@@ -179,20 +180,21 @@ object EmbeddingAdam2 {
   val logger = Logger.getLogger(this.getClass)
 
   private[optim] def updateSparse[T: ClassTag](
-    tid: Int,
-    taskSize: Int,
-    extraTask: Int,
-    embedding: Int,
-    buffer: Tensor[T],
-    clr: Double,
-    beta1: Double,
-    beta2: Double,
-    eps: Double,
-    gradient: Array[(Tensor[T], Tensor[T])],
-    parameter: Tensor[T],
-    parameterOffset: Int,
-    timestamps: Array[Int],
-    timestamp: Int
+      tid: Int,
+      taskSize: Int,
+      extraTask: Int,
+      embedding: Int,
+      buffer: Tensor[T],
+      clr: Double,
+      beta1: Double,
+      beta2: Double,
+      eps: Double,
+      gradient: Array[(Tensor[T], Tensor[T])],
+      parameter: Tensor[T],
+      parameterOffset: Int,
+      timestamps: Array[Int],
+      timestamp: Int,
+      modelParallelism: Int
   )(implicit ev: TensorNumeric[T]): Unit = {
     val idStart = tid * taskSize + math.min(tid, extraTask)
     val idLength = taskSize + (if (tid < extraTask) 1 else 0)
@@ -224,14 +226,12 @@ object EmbeddingAdam2 {
     }
     val recordArray = record.toArray.sortWith(_._1 < _._1)
     val dfdx = Tensor[T](embedding)
-    var count = 0
     i = 0
     while(i < recordArray.length) {
       val values = gradient(recordArray(i)._2)._2
       dfdx.add(values.select(1, recordArray(i)._3 + 1))
-      count += 1
       if (i == recordArray.length - 1 || recordArray(i)._4 != recordArray(i + 1)._4) {
-        dfdx.div(ev.fromType(count))
+        dfdx.div(ev.fromType(modelParallelism))
         val curS = _s.narrow(1, recordArray(i)._1 + 1, embedding).mul(ev.fromType[Double](beta1))
           .add(ev.fromType[Double](1 - beta1), dfdx)
         _denom.cmul(dfdx, dfdx)
@@ -246,7 +246,6 @@ object EmbeddingAdam2 {
         parameter.narrow(1, parameterOffset + recordArray(i)._4 * embedding + 1, embedding)
           .add(ev.fromType[Double](-stepSize), _denom)
         dfdx.zero()
-        count = 0
       }
       i += 1
     }
