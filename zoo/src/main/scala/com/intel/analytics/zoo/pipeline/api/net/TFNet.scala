@@ -19,10 +19,10 @@ import java.io.{File, FileInputStream, InputStream}
 import java.nio._
 
 import com.intel.analytics.bigdl.nn.abstractnn.{AbstractModule, Activity}
+import com.intel.analytics.bigdl.shaded.tensorflow.framework.GraphDef
 import com.intel.analytics.bigdl.tensor.Tensor
 import com.intel.analytics.bigdl.utils.{MultiShape, Shape, T}
 import com.intel.analytics.zoo.pipeline.api.net.TFNet.TFGraphHolder
-import org.tensorflow.framework.GraphDef
 import org.tensorflow.types.UInt8
 import org.tensorflow.{DataType, Graph, Session, Tensor => TTensor}
 
